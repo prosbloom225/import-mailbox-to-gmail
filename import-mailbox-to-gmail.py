@@ -25,6 +25,8 @@ import logging
 import logging.handlers
 import mailbox
 import os
+import time
+import thread
 
 from apiclient import discovery
 from apiclient.http import set_user_agent
@@ -33,6 +35,9 @@ from apiclient.http import MediaIoBaseUpload
 from oauth2client.service_account import ServiceAccountCredentials
 import oauth2client.tools
 import OpenSSL  # Required by Google API library, but not checked by it
+
+from multiprocessing.pool import ThreadPool
+from multiprocessing import Queue
 
 APPLICATION_NAME = 'import-mailbox-to-gmail'
 APPLICATION_VERSION = '1.1'
@@ -117,8 +122,8 @@ def get_credentials(username):
     Credentials, the obtained credential.
   """
   credentials = ServiceAccountCredentials.from_json_keyfile_name(
-      args.json,
-      scopes=SCOPES).create_delegated(username)
+          args.json,
+          scopes=SCOPES).create_delegated(username)
 
   return credentials
 
@@ -145,6 +150,70 @@ def get_label_id_from_name(service, username, labels, labelname):
     logging.error("Can't create label '%s' for user %s", labelname, username)
     raise
 
+def worker(queue):
+  global number_of_successes_in_label
+  global number_of_failures_in_label
+  while True:
+    try:
+      data = queue.get(True)
+      # unpack json
+      message = data['message']
+      index = data['index']
+      labelname = data['labelname']
+      label_id = data['label_id']
+      # import pdb;pdb.set_trace()
+    except Exception,e:
+      import pdb;pdb.set_trace()
+      if 'EOFError' in str(e):
+        return
+      else:
+        logging.exception(e)
+    # Process the message
+    logging.info("%d : Processing message %d in label '%s'", thread.get_ident(), index, labelname)
+    try:
+      if (args.replace_quoted_printable and
+          'Content-Type' in message and
+          'text/quoted-printable' in message['Content-Type']):
+        message.replace_header(
+            'Content-Type', message['Content-Type'].replace(
+                'text/quoted-printable', 'text/plain'))
+        logging.info('Replaced text/quoted-printable with text/plain')
+    except Exception:
+      logging.exception(
+          'Failed to replace text/quoted-printable with text/plain '
+          'in Content-Type header')
+    try:
+      if args.fix_msgid and 'Message-ID' in message:
+        msgid = message['Message-ID']
+        if msgid[0] != '<':
+          msgid = '<' + msgid
+          logging.info('Added < to Message-ID: %s', msgid)
+        if msgid[-1] != '>':
+          msgid += '>'
+          logging.info('Added > to Message-ID: %s', msgid)
+        message.replace_header('Message-ID', msgid)
+    except Exception:
+      logging.exception('Failed to fix brackets in Message-ID header')
+    try:
+      metadata_object = {'labelIds': [label_id]}
+      # Use media upload to allow messages more than 5mb.
+      # See https://developers.google.com/api-client-library/python/guide/media_upload
+      # and http://google-api-python-client.googlecode.com/hg/docs/epy/apiclient.http.MediaIoBaseUpload-class.html.
+      message_data = io.BytesIO(message.as_string().encode('utf-8'))
+      media = MediaIoBaseUpload(message_data,
+                                mimetype='message/rfc822')
+      # message_response = service.users().messages().insert(
+      #     userId=username,
+      #     internalDateSource='dateHeader',
+      #     body=metadata_object,
+      #     media_body=media).execute(num_retries=args.num_retries)
+      number_of_successes_in_label += 1
+      # logging.debug("Imported mbox message '%s' to Gmail ID %s",
+      #               message.get_from(), message_response['id'])
+    except Exception:
+      number_of_failures_in_label += 1
+      logging.exception('Failed to import mbox message')
+
 
 def process_mbox_files(username, service, labels):
   """Iterates over the mbox files found in the user's subdir and imports them.
@@ -160,6 +229,8 @@ def process_mbox_files(username, service, labels):
                 Number of messages imported without error,
                 Number of messages that failed.
   """
+  global number_of_successes_in_label
+  global number_of_failures_in_label
   number_of_labels_imported_without_error = 0
   number_of_labels_imported_with_some_errors = 0
   number_of_labels_failed = 0
@@ -178,55 +249,18 @@ def process_mbox_files(username, service, labels):
     mbox = mailbox.mbox(full_filename)
     label_id = get_label_id_from_name(service, username, labels, labelname)
     logging.info("Using label name '%s', ID '%s'", labelname, label_id)
+    queue = Queue()
+    worker_pool = ThreadPool(10, worker, (queue,))
     for index, message in enumerate(mbox):
-      logging.info("Processing message %d in label '%s'", index,
-                    labelname)
-      try:
-        if (args.replace_quoted_printable and
-            'Content-Type' in message and
-            'text/quoted-printable' in message['Content-Type']):
-          message.replace_header(
-              'Content-Type', message['Content-Type'].replace(
-                  'text/quoted-printable', 'text/plain'))
-          logging.info('Replaced text/quoted-printable with text/plain')
-      except Exception:
-        logging.exception(
-            'Failed to replace text/quoted-printable with text/plain '
-            'in Content-Type header')
-      try:
-        if args.fix_msgid and 'Message-ID' in message:
-          msgid = message['Message-ID']
-          if msgid[0] != '<':
-            msgid = '<' + msgid
-            logging.info('Added < to Message-ID: %s', msgid)
-          if msgid[-1] != '>':
-            msgid += '>'
-            logging.info('Added > to Message-ID: %s', msgid)
-          message.replace_header('Message-ID', msgid)
-      except Exception:
-        logging.exception('Failed to fix brackets in Message-ID header')
-      try:
-        metadata_object = {'labelIds': [label_id]}
-        # Use media upload to allow messages more than 5mb.
-        # See https://developers.google.com/api-client-library/python/guide/media_upload
-        # and http://google-api-python-client.googlecode.com/hg/docs/epy/apiclient.http.MediaIoBaseUpload-class.html.
-        message_data = io.BytesIO(message.as_string().encode('utf-8'))
-        media = MediaIoBaseUpload(message_data,
-                                  mimetype='message/rfc822')
-        message_response = service.users().messages().import_(
-            userId=username,
-            fields='id',
-            neverMarkSpam=True,
-            processForCalendar=False,
-            internalDateSource='dateHeader',
-            body=metadata_object,
-            media_body=media).execute(num_retries=args.num_retries)
-        number_of_successes_in_label += 1
-        logging.debug("Imported mbox message '%s' to Gmail ID %s",
-                      message.get_from(), message_response['id'])
-      except Exception:
-        number_of_failures_in_label += 1
-        logging.exception('Failed to import mbox message')
+      print index
+      # queue.put({
+      #   "message" : message,
+      #   "index" : index,
+      #   "labelname" : labelname,
+      #   "label_id" : label_id})
+    while queue.qsize() > 0:
+        logging.info("Tick: %d" % queue.qsize())
+        time.sleep(1)
     logging.info("Finished processing '%s'. %d messages imported successfully, "
                  "%d messages failed.",
                  full_filename,
@@ -288,6 +322,7 @@ def main():
   number_of_users_imported_without_error = 0
   number_of_users_imported_with_some_errors = 0
   number_of_users_failed = 0
+
 
   for username in next(os.walk(args.dir))[1]:
     try:
