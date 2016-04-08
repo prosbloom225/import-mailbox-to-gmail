@@ -27,6 +27,7 @@ import mailbox
 import os
 import time
 import thread
+import random
 
 from apiclient import discovery
 from apiclient.http import set_user_agent
@@ -153,6 +154,7 @@ def get_label_id_from_name(service, username, labels, labelname):
 def worker(queue):
   global number_of_successes_in_label
   global number_of_failures_in_label
+  service = None
   while True:
     try:
       data = queue.get(True)
@@ -161,9 +163,18 @@ def worker(queue):
       index = data['index']
       labelname = data['labelname']
       label_id = data['label_id']
-      # import pdb;pdb.set_trace()
+      username = data['username']
+
+
+      if service == None:
+        # Trying 
+        credentials = get_credentials(username)
+        http = credentials.authorize(set_user_agent(
+          httplib2.Http(),
+          '%s-%s' % (APPLICATION_NAME, APPLICATION_VERSION)))
+        service = discovery.build('gmail', 'v1', http=http)
+
     except Exception,e:
-      import pdb;pdb.set_trace()
       if 'EOFError' in str(e):
         return
       else:
@@ -194,25 +205,32 @@ def worker(queue):
         message.replace_header('Message-ID', msgid)
     except Exception:
       logging.exception('Failed to fix brackets in Message-ID header')
-    try:
-      metadata_object = {'labelIds': [label_id]}
-      # Use media upload to allow messages more than 5mb.
-      # See https://developers.google.com/api-client-library/python/guide/media_upload
-      # and http://google-api-python-client.googlecode.com/hg/docs/epy/apiclient.http.MediaIoBaseUpload-class.html.
-      message_data = io.BytesIO(message.as_string().encode('utf-8'))
-      media = MediaIoBaseUpload(message_data,
-                                mimetype='message/rfc822')
-      # message_response = service.users().messages().insert(
-      #     userId=username,
-      #     internalDateSource='dateHeader',
-      #     body=metadata_object,
-      #     media_body=media).execute(num_retries=args.num_retries)
-      number_of_successes_in_label += 1
-      # logging.debug("Imported mbox message '%s' to Gmail ID %s",
-      #               message.get_from(), message_response['id'])
-    except Exception:
-      number_of_failures_in_label += 1
-      logging.exception('Failed to import mbox message')
+    for n in range(0, args.num_retries):
+      try:
+        metadata_object = {'labelIds': [label_id]}
+        # Use media upload to allow messages more than 5mb.
+        # See https://developers.google.com/api-client-library/python/guide/media_upload
+        # and http://google-api-python-client.googlecode.com/hg/docs/epy/apiclient.http.MediaIoBaseUpload-class.html.
+        message_data = io.BytesIO(message.as_string().encode('utf-8'))
+        media = MediaIoBaseUpload(message_data,
+                                  mimetype='message/rfc822')
+        message_response = service.users().messages().insert(
+            userId=username,
+            internalDateSource='dateHeader',
+            body=metadata_object,
+            media_body=media).execute(num_retries=args.num_retries)
+        number_of_successes_in_label += 1
+        logging.debug("Imported mbox message '%s' to Gmail ID %s",
+                      message.get_from(), message_response['id'])
+        break
+      except Exception,e:
+        if 'Too many concurrent' in str(e):
+          logging.info("Concurrency limit hit, waiting then retrying")
+          time.sleep((2 ** n) + random.random())
+          continue
+        else:
+          number_of_failures_in_label += 1
+          logging.exception('Failed to import mbox message')
 
 
 def process_mbox_files(username, service, labels):
@@ -250,16 +268,17 @@ def process_mbox_files(username, service, labels):
     label_id = get_label_id_from_name(service, username, labels, labelname)
     logging.info("Using label name '%s', ID '%s'", labelname, label_id)
     queue = Queue()
-    worker_pool = ThreadPool(10, worker, (queue,))
     for index, message in enumerate(mbox):
-      print index
-      # queue.put({
-      #   "message" : message,
-      #   "index" : index,
-      #   "labelname" : labelname,
-      #   "label_id" : label_id})
+      queue.put({
+        "message" : message,
+        "index" : index,
+        "labelname" : labelname,
+        "label_id" : label_id,
+        "username" : username})
+    logging.info("Queue has been filled: %d" % queue.qsize())
+    worker_pool = ThreadPool(50, worker, (queue,))
     while queue.qsize() > 0:
-        logging.info("Tick: %d" % queue.qsize())
+        # logging.info("Tick: %d" % queue.qsize())
         time.sleep(1)
     logging.info("Finished processing '%s'. %d messages imported successfully, "
                  "%d messages failed.",
