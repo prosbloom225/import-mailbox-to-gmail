@@ -38,13 +38,20 @@ import oauth2client.tools
 import OpenSSL  # Required by Google API library, but not checked by it
 
 from multiprocessing.pool import ThreadPool
-from multiprocessing import Queue
+# from multiprocessing import Queue
+
+import threading
+import Queue
 
 APPLICATION_NAME = 'import-mailbox-to-gmail'
 APPLICATION_VERSION = '1.1'
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.insert',
           'https://www.googleapis.com/auth/gmail.labels']
+
+WORKER_THREADS = 1
+CONCUR_USERS = 3
+sentinel = None
 
 
 parser = argparse.ArgumentParser(
@@ -276,7 +283,7 @@ def process_mbox_files(username, service, labels):
         "label_id" : label_id,
         "username" : username})
     logging.info("Queue has been filled: %d" % queue.qsize())
-    worker_pool = ThreadPool(50, worker, (queue,))
+    worker_pool = ThreadPool(WORKER_THREADS, worker, (queue,))
     while queue.qsize() > 0:
         # logging.info("Tick: %d" % queue.qsize())
         time.sleep(1)
@@ -299,51 +306,17 @@ def process_mbox_files(username, service, labels):
           number_of_messages_imported_without_error,   # 3
           number_of_messages_failed)                   # 4
 
+def user_worker(queue):
+  while True:
+    username = queue.get(True)
+    if username == sentinel:
+      logging.info("Thread done")
+      break
+    ## temp bypass
+    # time.sleep(5)
+    # queue.task_done()
+    # continue
 
-def main():
-  """Import multiple users' mbox files to Gmail.
-
-  """
-  httplib2.debuglevel = args.httplib2debuglevel
-  # Use args.logging_level if defined.
-  try:
-    logging_level = args.logging_level
-  except AttributeError:
-    logging_level = 'INFO'
-
-  # Default logging to standard output
-  logging.basicConfig(
-      level=logging_level,
-      format='%(asctime)s %(levelname)s %(funcName)s@%(filename)s %(message)s',
-      datefmt='%H:%M:%S')
-
-  # More detailed logging to file
-  file_handler = logging.handlers.RotatingFileHandler(args.log,
-                                                      maxBytes=1024 * 1024 * 32,
-                                                      backupCount=8)
-  file_formatter = logging.Formatter(
-      '%(asctime)s %(process)d %(levelname)s %(funcName)s '
-      '(%(filename)s:%(lineno)d) %(message)s')
-  file_formatter.datefmt = '%Y-%m-%dT%H:%M:%S (%z)'
-  file_handler.setFormatter(file_formatter)
-  logging.getLogger().addHandler(file_handler)
-
-  logging.info('*** Starting %s %s ***', APPLICATION_NAME, APPLICATION_VERSION)
-  logging.info('Arguments:')
-  for arg, value in sorted(vars(args).items()):
-    logging.info('\t%s: %r', arg, value)
-
-  number_of_labels_imported_without_error = 0
-  number_of_labels_imported_with_some_errors = 0
-  number_of_labels_failed = 0
-  number_of_messages_imported_without_error = 0
-  number_of_messages_failed = 0
-  number_of_users_imported_without_error = 0
-  number_of_users_imported_with_some_errors = 0
-  number_of_users_failed = 0
-
-
-  for username in next(os.walk(args.dir))[1]:
     try:
       logging.info('Processing user %s', username)
       try:
@@ -389,9 +362,87 @@ def main():
                    result[2],
                    result[3],
                    result[4])
+      queue.task_done()
     except Exception:
       number_of_users_failed += 1
       logging.exception("Can't process user %s", username)
+      queue.task_done()
+
+
+def main():
+  """Import multiple users' mbox files to Gmail.
+
+  """
+  httplib2.debuglevel = args.httplib2debuglevel
+  # Use args.logging_level if defined.
+  try:
+    logging_level = args.logging_level
+  except AttributeError:
+    logging_level = 'INFO'
+
+  # Default logging to standard output
+  logging.basicConfig(
+      level=logging_level,
+      format='%(asctime)s %(levelname)s %(funcName)s@%(filename)s %(message)s',
+      datefmt='%H:%M:%S')
+
+  # More detailed logging to file
+  file_handler = logging.handlers.RotatingFileHandler(args.log,
+                                                      maxBytes=1024 * 1024 * 32,
+                                                      backupCount=8)
+  file_formatter = logging.Formatter(
+      '%(asctime)s %(process)d %(levelname)s %(funcName)s '
+      '(%(filename)s:%(lineno)d) %(message)s')
+  file_formatter.datefmt = '%Y-%m-%dT%H:%M:%S (%z)'
+  file_handler.setFormatter(file_formatter)
+  logging.getLogger().addHandler(file_handler)
+
+  logging.info('*** Starting %s %s ***', APPLICATION_NAME, APPLICATION_VERSION)
+  logging.info('Arguments:')
+  for arg, value in sorted(vars(args).items()):
+    logging.info('\t%s: %r', arg, value)
+
+  number_of_labels_imported_without_error = 0
+  number_of_labels_imported_with_some_errors = 0
+  number_of_labels_failed = 0
+  number_of_messages_imported_without_error = 0
+  number_of_messages_failed = 0
+  number_of_users_imported_without_error = 0
+  number_of_users_imported_with_some_errors = 0
+  number_of_users_failed = 0
+
+  logging.info("Kicking off %d user threads" % CONCUR_USERS)
+##
+  user_queue = Queue.Queue()
+  logging.info("Queue has been filled: %d" % user_queue.qsize())
+  user_pool = [threading.Thread(target=user_worker,args=(user_queue,))
+         for n in range(CONCUR_USERS)]
+  for t in user_pool:
+    t.start()
+
+  users = next(os.walk(args.dir))[1]
+  seg_users = [users[i:i+CONCUR_USERS] for i in range(0,len(users),CONCUR_USERS)]
+  for seg in seg_users:
+    logging.info("Tick")
+    for user in seg:
+      logging.info("Adding user: %s" % user)
+      user_queue.put(user)
+    while user_queue.qsize() > 0:
+      logging.info("Tock: %d" % user_queue.qsize())
+      time.sleep(1)
+
+  user_queue.join()
+  logging.info("Injecting sentinel")
+  for i in range(CONCUR_USERS):
+      user_queue.put(sentinel)
+
+  logging.info("Waiting for threads to close")
+  for t in user_pool:
+      t.join()
+  logging.info("Threads are closed")
+##
+
+  ## Finished
   logging.info("*** Done importing all users from directory '%s'", args.dir)
   logging.info('*** Import summary:')
   logging.info('    %d users imported with no failures',
@@ -418,3 +469,4 @@ def main():
 
 if __name__ == '__main__':
   main()
+
