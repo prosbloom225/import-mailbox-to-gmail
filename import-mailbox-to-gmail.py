@@ -49,9 +49,19 @@ APPLICATION_VERSION = '1.1'
 SCOPES = ['https://www.googleapis.com/auth/gmail.insert',
           'https://www.googleapis.com/auth/gmail.labels']
 
-WORKER_THREADS = 1
+WORKER_THREADS = 25
 CONCUR_USERS = 3
 sentinel = None
+
+
+number_of_labels_imported_without_error = 0
+number_of_labels_imported_with_some_errors = 0
+number_of_labels_failed = 0
+number_of_messages_imported_without_error = 0
+number_of_messages_failed = 0
+number_of_users_imported_without_error = 0
+number_of_users_imported_with_some_errors = 0
+number_of_users_failed = 0
 
 
 parser = argparse.ArgumentParser(
@@ -274,7 +284,8 @@ def process_mbox_files(username, service, labels):
     mbox = mailbox.mbox(full_filename)
     label_id = get_label_id_from_name(service, username, labels, labelname)
     logging.info("Using label name '%s', ID '%s'", labelname, label_id)
-    queue = Queue()
+
+    queue = Queue.Queue()
     for index, message in enumerate(mbox):
       queue.put({
         "message" : message,
@@ -282,7 +293,7 @@ def process_mbox_files(username, service, labels):
         "labelname" : labelname,
         "label_id" : label_id,
         "username" : username})
-    logging.info("Queue has been filled: %d" % queue.qsize())
+    logging.info("Queue has been filled for user %s: %d" % (username,queue.qsize()))
     worker_pool = ThreadPool(WORKER_THREADS, worker, (queue,))
     while queue.qsize() > 0:
         # logging.info("Tick: %d" % queue.qsize())
@@ -307,6 +318,14 @@ def process_mbox_files(username, service, labels):
           number_of_messages_failed)                   # 4
 
 def user_worker(queue):
+  global number_of_labels_imported_without_error
+  global number_of_labels_imported_with_some_errors
+  global number_of_labels_failed
+  global number_of_messages_imported_without_error
+  global number_of_messages_failed
+  global number_of_users_imported_without_error
+  global number_of_users_imported_with_some_errors
+  global number_of_users_failed
   while True:
     username = queue.get(True)
     if username == sentinel:
@@ -402,14 +421,6 @@ def main():
   for arg, value in sorted(vars(args).items()):
     logging.info('\t%s: %r', arg, value)
 
-  number_of_labels_imported_without_error = 0
-  number_of_labels_imported_with_some_errors = 0
-  number_of_labels_failed = 0
-  number_of_messages_imported_without_error = 0
-  number_of_messages_failed = 0
-  number_of_users_imported_without_error = 0
-  number_of_users_imported_with_some_errors = 0
-  number_of_users_failed = 0
 
   logging.info("Kicking off %d user threads" % CONCUR_USERS)
 ##
