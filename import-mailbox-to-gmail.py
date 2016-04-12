@@ -43,14 +43,15 @@ from multiprocessing.pool import ThreadPool
 import threading
 import Queue
 
+
 APPLICATION_NAME = 'import-mailbox-to-gmail'
 APPLICATION_VERSION = '1.1'
 
 SCOPES = ['https://www.googleapis.com/auth/gmail.insert',
           'https://www.googleapis.com/auth/gmail.labels']
 
-WORKER_THREADS = 25
-CONCUR_USERS = 3
+WORKER_THREADS = 30
+CONCUR_USERS = 10
 sentinel = None
 
 
@@ -155,9 +156,9 @@ def get_label_id_from_name(service, username, labels, labelname):
   logging.info("Label '%s' doesn't exist, creating it", labelname)
   try:
     label_object = {
-        'messageListVisibility': 'show',
+        'messageListVisibility': 'hide',
         'name': labelname,
-        'labelListVisibility': 'labelShow'
+        'labelListVisibility': 'labelHide'
     }
     label = service.users().labels().create(
         userId=username,
