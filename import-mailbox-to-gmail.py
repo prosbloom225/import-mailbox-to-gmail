@@ -43,6 +43,7 @@ from multiprocessing.pool import ThreadPool
 import threading
 import Queue
 
+import sqlite3
 
 APPLICATION_NAME = 'import-mailbox-to-gmail'
 APPLICATION_VERSION = '1.1'
@@ -53,6 +54,8 @@ SCOPES = ['https://www.googleapis.com/auth/gmail.insert',
 WORKER_THREADS = 30
 CONCUR_USERS = 10
 sentinel = None
+DRY_RUN = True
+FAIL_ALL = True
 
 
 number_of_labels_imported_without_error = 0
@@ -63,6 +66,7 @@ number_of_messages_failed = 0
 number_of_users_imported_without_error = 0
 number_of_users_imported_with_some_errors = 0
 number_of_users_failed = 0
+
 
 
 parser = argparse.ArgumentParser(
@@ -154,20 +158,24 @@ def get_label_id_from_name(service, username, labels, labelname):
       return label['id']
 
   logging.info("Label '%s' doesn't exist, creating it", labelname)
-  try:
-    label_object = {
-        'messageListVisibility': 'hide',
-        'name': labelname,
-        'labelListVisibility': 'labelHide'
-    }
-    label = service.users().labels().create(
-        userId=username,
-        body=label_object).execute(num_retries=args.num_retries)
-    logging.info("Label '%s' created", labelname)
-    return label['id']
-  except Exception:
-    logging.error("Can't create label '%s' for user %s", labelname, username)
-    raise
+  if DRY_RUN == True:
+      logging.info("[DRY_RUN] Adding label: %s" % labelname)
+      return labelname
+  else:
+      try:
+        label_object = {
+            'messageListVisibility': 'hide',
+            'name': labelname,
+            'labelListVisibility': 'labelHide'
+        }
+        label = service.users().labels().create(
+            userId=username,
+            body=label_object).execute(num_retries=args.num_retries)
+        logging.info("Label '%s' created", labelname)
+        return label['id']
+      except Exception:
+        logging.error("Can't create label '%s' for user %s", labelname, username)
+        raise
 
 def worker(queue):
   global number_of_successes_in_label
@@ -182,6 +190,7 @@ def worker(queue):
       labelname = data['labelname']
       label_id = data['label_id']
       username = data['username']
+      mbox = data['mbox']
 
 
       if service == None:
@@ -232,14 +241,22 @@ def worker(queue):
         message_data = io.BytesIO(message.as_string().encode('utf-8'))
         media = MediaIoBaseUpload(message_data,
                                   mimetype='message/rfc822')
-        message_response = service.users().messages().insert(
-            userId=username,
-            internalDateSource='dateHeader',
-            body=metadata_object,
-            media_body=media).execute(num_retries=args.num_retries)
-        number_of_successes_in_label += 1
-        logging.debug("Imported mbox message '%s' to Gmail ID %s",
-                      message.get_from(), message_response['id'])
+        ## execute
+        if FAIL_ALL == True:
+            raise Exception("FAIL_ALL Exception triggered")
+        if DRY_RUN == True:
+            logging.info("[DRY_RUN] Imported mbox message %s to Gmail ID %s on try %d" % (
+                message.get_from(), "TESTIDNOTHINGTOSEEHERE", n))
+            number_of_successes_in_label += 1
+        else:
+            message_response = service.users().messages().insert(
+                userId=username,
+                internalDateSource='dateHeader',
+                body=metadata_object,
+                media_body=media).execute(num_retries=args.num_retries)
+            number_of_successes_in_label += 1
+            logging.debug("Imported mbox message '%s' to Gmail ID %s on try %d",
+                          message.get_from(), message_response['id'], n)
         break
       except Exception,e:
         if 'Too many concurrent' in str(e):
@@ -249,6 +266,18 @@ def worker(queue):
         else:
           number_of_failures_in_label += 1
           logging.exception('Failed to import mbox message')
+          try:
+            conn = sqlite3.connect('data.db')
+            cur = conn.cursor()
+            logging.info('INSERT INTO failures VALUES(\'%s\', \'%s\', \'%s\', \'%s\');' % (username, mbox, msgid, str(e)))
+            cur.execute('INSERT INTO failures VALUES(\'%s\', \'%s\', \'%s\', \'%s\');' % (username, mbox, msgid, str(e)))
+            conn.commit()
+            conn.close()
+            logging.debug('SQL OK!')
+          except Exception,e:
+            logging.info("FAILED TO MAKE DATABASE INSERT: %s", str(e))
+        if FAIL_ALL:
+            break
 
 
 def process_mbox_files(username, service, labels):
@@ -293,6 +322,7 @@ def process_mbox_files(username, service, labels):
         "index" : index,
         "labelname" : labelname,
         "label_id" : label_id,
+        "mbox" : full_filename,
         "username" : username})
     logging.info("Queue has been filled for user %s: %d" % (username,queue.qsize()))
     worker_pool = ThreadPool(WORKER_THREADS, worker, (queue,))
@@ -304,6 +334,16 @@ def process_mbox_files(username, service, labels):
                  full_filename,
                  number_of_successes_in_label,
                  number_of_failures_in_label)
+    try:
+        conn = sqlite3.connect('data.db')
+        cur = conn.cursor()
+        cur.execute('INSERT INTO mbox VALUES(\'%s\', \'%s\', %d, %d);' % (username, full_filename, number_of_successes_in_label, number_of_failures_in_label))
+        conn.commit()
+        conn.close()
+        logging.debug('SQL OK!')
+    except Exception,e:
+        logging.info("FAILED TO MAKE DATABASE INSERT: %s", str(e))
+
     if number_of_failures_in_label == 0:
       number_of_labels_imported_without_error += 1
     elif number_of_successes_in_label > 0:
@@ -334,6 +374,7 @@ def user_worker(queue):
       break
     ## temp bypass
     # time.sleep(5)
+    # print username
     # queue.task_done()
     # continue
 
@@ -443,6 +484,7 @@ def main():
       logging.info("Tock: %d" % user_queue.qsize())
       time.sleep(1)
 
+  logging.info("Waiting for user queue to complete")
   user_queue.join()
   logging.info("Injecting sentinel")
   for i in range(CONCUR_USERS):
