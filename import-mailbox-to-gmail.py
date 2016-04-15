@@ -28,6 +28,7 @@ import os
 import time
 import thread
 import random
+import sys
 
 from apiclient import discovery
 from apiclient.http import set_user_agent
@@ -52,7 +53,7 @@ SCOPES = ['https://www.googleapis.com/auth/gmail.insert',
           'https://www.googleapis.com/auth/gmail.labels']
 
 WORKER_THREADS = 30
-CONCUR_USERS = 10
+CONCUR_USERS = 20
 sentinel = None
 DRY_RUN = True
 FAIL_ALL = True
@@ -265,7 +266,6 @@ def worker(queue):
           continue
         else:
           number_of_failures_in_label += 1
-          logging.exception('Failed to import mbox message')
           try:
             conn = sqlite3.connect('data.db')
             cur = conn.cursor()
@@ -274,6 +274,7 @@ def worker(queue):
             conn.commit()
             conn.close()
             logging.debug('SQL OK!')
+            logging.exception('Failed to import mbox message')
           except Exception,e:
             logging.info("FAILED TO MAKE DATABASE INSERT: %s", str(e))
         if FAIL_ALL:
@@ -474,15 +475,29 @@ def main():
     t.start()
 
   users = next(os.walk(args.dir))[1]
-  seg_users = [users[i:i+CONCUR_USERS] for i in range(0,len(users),CONCUR_USERS)]
-  for seg in seg_users:
-    logging.info("Tick")
-    for user in seg:
-      logging.info("Adding user: %s" % user)
+  # seg_users = [users[i:i+CONCUR_USERS] for i in range(0,len(users),CONCUR_USERS)]
+  # for seg in seg_users:
+  #   logging.info("Tick")
+  #   for user in seg:
+  #     logging.info("Adding user: %s" % user)
+  #     user_queue.put(user)
+  #   while user_queue.qsize() > 0:
+  #     logging.info("Tock: %d" % user_queue.qsize())
+  #     time.sleep(1)
+
+  # trying new logic for user_queue control
+  for user in users:
+      logging.info("Adding user %s to queue with size %d" % (user, user_queue.qsize()))
       user_queue.put(user)
-    while user_queue.qsize() > 0:
-      logging.info("Tock: %d" % user_queue.qsize())
-      time.sleep(1)
+      while user_queue.qsize() > CONCUR_USERS:
+          logging.info("Tock: %d" % user_queue.qsize())
+          time.sleep(1)
+      # temp kill
+      # for i in range(CONCUR_USERS):
+      #     user_queue.put(sentinel)
+      # for t in user_pool:
+      #     t.join()
+      # sys.exit()
 
   logging.info("Waiting for user queue to complete")
   user_queue.join()
