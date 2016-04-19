@@ -29,6 +29,7 @@ import time
 import thread
 import random
 import sys
+import datetime
 
 from apiclient import discovery
 from apiclient.http import set_user_agent
@@ -44,7 +45,10 @@ from multiprocessing.pool import ThreadPool
 import threading
 import Queue
 
-import sqlite3
+# import sqlite3
+import psycopg2
+import psycopg2.pool
+from contextlib import contextmanager
 
 APPLICATION_NAME = 'import-mailbox-to-gmail'
 APPLICATION_VERSION = '1.1'
@@ -52,8 +56,8 @@ APPLICATION_VERSION = '1.1'
 SCOPES = ['https://www.googleapis.com/auth/gmail.insert',
           'https://www.googleapis.com/auth/gmail.labels']
 
-WORKER_THREADS = 30
-CONCUR_USERS = 20
+WORKER_THREADS = 1
+CONCUR_USERS = 3
 sentinel = None
 DRY_RUN = True
 FAIL_ALL = True
@@ -69,6 +73,8 @@ number_of_users_imported_with_some_errors = 0
 number_of_users_failed = 0
 
 
+
+db = psycopg2.pool.ThreadedConnectionPool(1, WORKER_THREADS, host='localhost', user='postgres', password='kadabra')
 
 parser = argparse.ArgumentParser(
     description='Import mbox files to a specified label for many users.',
@@ -183,6 +189,7 @@ def worker(queue):
   global number_of_failures_in_label
   service = None
   while True:
+    logging.info('Worker Tick')
     try:
       data = queue.get(True)
       # unpack json
@@ -266,17 +273,20 @@ def worker(queue):
           continue
         else:
           number_of_failures_in_label += 1
-          try:
-            conn = sqlite3.connect('data.db')
-            cur = conn.cursor()
-            logging.info('INSERT INTO failures VALUES(\'%s\', \'%s\', \'%s\', \'%s\');' % (username, mbox, msgid, str(e)))
-            cur.execute('INSERT INTO failures VALUES(\'%s\', \'%s\', \'%s\', \'%s\');' % (username, mbox, msgid, str(e)))
-            conn.commit()
-            conn.close()
-            logging.debug('SQL OK!')
-            logging.exception('Failed to import mbox message')
-          except Exception,e:
-            logging.info("FAILED TO MAKE DATABASE INSERT: %s", str(e))
+          # try:
+          #   conn = sqlite3.connect('data.db')
+          #   cur = conn.cursor()
+          #   logging.info('INSERT INTO failures VALUES(\'%s\', \'%s\', \'%s\', \'%s\');' % (username, mbox, msgid, str(e)))
+          #   cur.execute('INSERT INTO failures VALUES(\'%s\', \'%s\', \'%s\', \'%s\');' % (username, mbox, msgid, str(e)))
+          #   conn.commit()
+          #   conn.close()
+          #   logging.debug('SQL OK!')
+          #   logging.exception('Failed to import mbox message')
+          # except Exception,e:
+          #   logging.info("FAILED TO MAKE DATABASE INSERT: %s", str(e))
+
+        with get_cursor() as cursor:
+          cursor.execute("INSERT INTO FAILURES VALUES (\'%s\', \'%s\', \'%s\', \'%s\', \'%s\');" % (username, mbox, msgid, str(e), str(datetime.datetime.now())))
         if FAIL_ALL:
             break
 
@@ -335,15 +345,17 @@ def process_mbox_files(username, service, labels):
                  full_filename,
                  number_of_successes_in_label,
                  number_of_failures_in_label)
-    try:
-        conn = sqlite3.connect('data.db')
-        cur = conn.cursor()
-        cur.execute('INSERT INTO mbox VALUES(\'%s\', \'%s\', %d, %d);' % (username, full_filename, number_of_successes_in_label, number_of_failures_in_label))
-        conn.commit()
-        conn.close()
-        logging.debug('SQL OK!')
-    except Exception,e:
-        logging.info("FAILED TO MAKE DATABASE INSERT: %s", str(e))
+    # try:
+    #     conn = sqlite3.connect('data.db')
+    #     cur = conn.cursor()
+    #     cur.execute('INSERT INTO mbox VALUES(\'%s\', \'%s\', %d, %d);' % (username, full_filename, number_of_successes_in_label, number_of_failures_in_label))
+    #     conn.commit()
+    #     conn.close()
+    #     logging.debug('SQL OK!')
+    # except Exception,e:
+    #     logging.info("FAILED TO MAKE DATABASE INSERT: %s", str(e))
+    with get_cursor() as cursor:
+      cursor.execute("INSERT INTO mbox VALUES(\'%s\', \'%s\', %d, %d);" % (username, full_filename, number_of_successes_in_label, number_of_failures_in_label))
 
     if number_of_failures_in_label == 0:
       number_of_labels_imported_without_error += 1
@@ -369,6 +381,7 @@ def user_worker(queue):
   global number_of_users_imported_with_some_errors
   global number_of_users_failed
   while True:
+    logging.info("USER_WORKER TICK")
     username = queue.get(True)
     if username == sentinel:
       logging.info("Thread done")
@@ -430,6 +443,15 @@ def user_worker(queue):
       logging.exception("Can't process user %s", username)
       queue.task_done()
 
+@contextmanager
+def get_cursor():
+  conn = db.getconn()
+  try:
+    yield conn.cursor()
+    conn.commit()
+  finally:
+    db.putconn(conn)
+
 
 def main():
   """Import multiple users' mbox files to Gmail.
@@ -441,6 +463,7 @@ def main():
     logging_level = args.logging_level
   except AttributeError:
     logging_level = 'INFO'
+
 
   # Default logging to standard output
   logging.basicConfig(
